@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""
+Secure Password Manager (Local Vault)
+- AES-256-GCM encryption
+- scrypt key derivation from master password
+- Stores encrypted entries in a single vault file (JSON)
+"""
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import secrets
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+
+VAULT_VERSION = 1
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def b64e(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("utf-8")
+
+
+def b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s.encode("utf-8"))
+
+
+def derive_key_scrypt(password: str, salt: bytes, n: int, r: int, p: int, length: int = 32) -> bytes:
+    # scrypt parameters: n must be power of two, r and p moderate.
+    kdf = Scrypt(salt=salt, length=length, n=n, r=r, p=p)
+    return kdf.derive(password.encode("utf-8"))
+
+
+def encrypt_json(aesgcm: AESGCM, plaintext_obj: Any) -> Dict[str, str]:
+    nonce = secrets.token_bytes(12)  # 96-bit nonce recommended for GCM
+    plaintext = json.dumps(plaintext_obj, ensure_ascii=False).encode("utf-8")
+    ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+    return {"nonce": b64e(nonce), "ct": b64e(ciphertext)}
+
+
+def decrypt_json(aesgcm: AESGCM, blob: Dict[str, str]) -> Any:
+    nonce = b64d(blob["nonce"])
+    ct = b64d(blob["ct"])
+    plaintext = aesgcm.decrypt(nonce, ct, associated_data=None)
+    return json.loads(plaintext.decode("utf-8"))
+
+
+def ensure_private_file_permissions(path: str) -> None:
+    """
+    Best-effort: On Unix, set file to 0600. On Windows, we do not alter ACLs here,
+    but recommend storing in a user profile directory and using NTFS permissions.
+    """
+    try:
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+    except Exception:
+        # Don't fail vault operations due to permission errors.
+        pass
+
+
+@dataclass
+class Vault:
+    path: str
+    data: Dict[str, Any]
+
+    @staticmethod
+    def init_new(path: str, master_password: str, n: int, r: int, p: int) -> "Vault":
+        if os.path.exists(path):
+            raise FileExistsError(f"Vault already exists: {path}")
+
+        salt = secrets.token_bytes(16)
+        key = derive_key_scrypt(master_password, salt, n=n, r=r, p=p, length=32)
+        aesgcm = AESGCM(key)
+
+        # The vault stores entries encrypted individually; metadata is unencrypted except KDF params and version.
+        data = {
+            "version": VAULT_VERSION,
+            "kdf": {
+                "name": "scrypt",
+                "salt": b64e(salt),
+                "n": n,
+                "r": r,
+                "p": p,
+                "length": 32,
+            },
+            "created_utc": utc_now_iso(),
+            "entries": [],  # list of encrypted blobs with minimal plaintext labels
+        }
+
+        v = Vault(path=path, data=data)
+        v.save()
+        ensure_private_file_permissions(path)
+        # quick sanity: try to encrypt/decrypt a test value
+        _ = decrypt_json(aesgcm, encrypt_json(aesgcm, {"ok": True}))
+        return v
+
+    @staticmethod
+    def load(path: str) -> "Vault":
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Vault not found: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("version") != VAULT_VERSION:
+            raise ValueError(f"Unsupported vault version: {data.get('version')}")
+        if "kdf" not in data or "entries" not in data:
+            raise ValueError("Invalid vault format.")
+        return Vault(path=path, data=data)
+
+    def save(self) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+        ensure_private_file_permissions(self.path)
+
+    def unlock(self, master_password: str) -> AESGCM:
+        kdf = self.data["kdf"]
+        salt = b64d(kdf["salt"])
+        key = derive_key_scrypt(master_password, salt, n=int(kdf["n"]), r=int(kdf["r"]), p=int(kdf["p"]), length=int(kdf["length"]))
+        return AESGCM(key)
+
+    def find_entry_index(self, label: str) -> int:
+        for i, e in enumerate(self.data["entries"]):
+            if e.get("label") == label:
+                return i
+        return -1
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    master = getpass.getpass("Create master password: ")
+    master2 = getpass.getpass("Confirm master password: ")
+    if master != master2:
+        raise ValueError("Master passwords do not match.")
+    if len(master) < 12:
+        print("Warning: consider using a 12+ character master password.", file=sys.stderr)
+
+    Vault.init_new(args.vault, master, n=args.n, r=args.r, p=args.p)
+    print(f"Initialized new vault: {args.vault}")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    vault = Vault.load(args.vault)
+    master = getpass.getpass("Master password: ")
+    aesgcm = vault.unlock(master)
+
+    label = args.label
+    if vault.find_entry_index(label) != -1:
+        raise ValueError(f"Entry already exists: {label}")
+
+    username = args.username or input("Username: ").strip()
+    if args.password:
+        password = args.password
+    else:
+        password = getpass.getpass("Password (leave blank to generate): ")
+        if password == "":
+            password = generate_password(args.length)
+
+    notes = args.notes or ""
+
+    entry_plain = {
+        "label": label,
+        "username": username,
+        "password": password,
+        "notes": notes,
+        "created_utc": utc_now_iso(),
+        "updated_utc": utc_now_iso(),
+    }
+    entry_blob = encrypt_json(aesgcm, entry_plain)
+
+    vault.data["entries"].append({
+        "label": label,        # plaintext label for listing
+        "blob": entry_blob,    # encrypted full entry
+    })
+    vault.save()
+    print(f"Added entry: {label}")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    vault = Vault.load(args.vault)
+    labels = [e.get("label") for e in vault.data["entries"]]
+    labels = sorted([l for l in labels if l])
+    if not labels:
+        print("No entries.")
+        return
+    for l in labels:
+        print(l)
+
+
+def cmd_get(args: argparse.Namespace) -> None:
+    vault = Vault.load(args.vault)
+    master = getpass.getpass("Master password: ")
+    aesgcm = vault.unlock(master)
+
+    idx = vault.find_entry_index(args.label)
+    if idx == -1:
+        raise ValueError(f"Entry not found: {args.label}")
+
+    enc = vault.data["entries"][idx]["blob"]
+    entry = decrypt_json(aesgcm, enc)
+
+    # Output options
+    if args.field:
+        if args.field not in entry:
+            raise ValueError(f"Unknown field: {args.field}")
+        print(entry[args.field])
+    else:
+        print(f"Label:    {entry['label']}")
+        print(f"Username: {entry['username']}")
+        print(f"Password: {entry['password']}")
+        if entry.get("notes"):
+            print(f"Notes:    {entry['notes']}")
+        print(f"Created:  {entry['created_utc']}")
+        print(f"Updated:  {entry['updated_utc']}")
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    vault = Vault.load(args.vault)
+    label = args.label
+    idx = vault.find_entry_index(label)
+    if idx == -1:
+        raise ValueError(f"Entry not found: {label}")
+
+    confirm = input(f"Type the label to confirm deletion ({label}): ").strip()
+    if confirm != label:
+        print("Cancelled.")
+        return
+
+    vault.data["entries"].pop(idx)
+    vault.save()
+    print(f"Removed entry: {label}")
+
+
+def cmd_change_master(args: argparse.Namespace) -> None:
+    vault = Vault.load(args.vault)
+
+    old_master = getpass.getpass("Current master password: ")
+    old_aesgcm = vault.unlock(old_master)
+
+    new_master = getpass.getpass("New master password: ")
+    new_master2 = getpass.getpass("Confirm new master password: ")
+    if new_master != new_master2:
+        raise ValueError("New master passwords do not match.")
+    if len(new_master) < 12:
+        print("Warning: consider using a 12+ character master password.", file=sys.stderr)
+
+    # Decrypt all entries with old key, then re-encrypt with new key + new salt
+    kdf_old = vault.data["kdf"]
+    n, r, p = int(kdf_old["n"]), int(kdf_old["r"]), int(kdf_old["p"])
+
+    new_salt = secrets.token_bytes(16)
+    new_key = derive_key_scrypt(new_master, new_salt, n=n, r=r, p=p, length=32)
+    new_aesgcm = AESGCM(new_key)
+
+    new_entries = []
+    for e in vault.data["entries"]:
+        plain = decrypt_json(old_aesgcm, e["blob"])
+        plain["updated_utc"] = utc_now_iso()
+        new_entries.append({
+            "label": plain["label"],
+            "blob": encrypt_json(new_aesgcm, plain),
+        })
+
+    vault.data["kdf"]["salt"] = b64e(new_salt)
+    vault.data["entries"] = new_entries
+    vault.save()
+    print("Master password changed (vault re-keyed).")
+
+
+def generate_password(length: int = 20) -> str:
+    # URL-safe, avoids ambiguous chars; meets typical password policies
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~!@#$%^&*()+="
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="vault",
+        description="Secure local password manager (AES-256-GCM + scrypt)."
+    )
+    p.add_argument("--vault", default="vault.json", help="Path to vault file (default: vault.json)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_init = sub.add_parser("init", help="Initialize a new vault")
+    p_init.add_argument("--n", type=int, default=2**15, help="scrypt N parameter (power of two). Default: 32768")
+    p_init.add_argument("--r", type=int, default=8, help="scrypt r parameter. Default: 8")
+    p_init.add_argument("--p", type=int, default=1, help="scrypt p parameter. Default: 1")
+    p_init.set_defaults(func=cmd_init)
+
+    p_add = sub.add_parser("add", help="Add an entry")
+    p_add.add_argument("label", help="Entry label (e.g., github, bank)")
+    p_add.add_argument("--username", help="Username")
+    p_add.add_argument("--password", help="Password (omit to be prompted or generated)")
+    p_add.add_argument("--notes", help="Notes")
+    p_add.add_argument("--length", type=int, default=20, help="Generated password length if blank (default: 20)")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="List entry labels")
+    p_list.set_defaults(func=cmd_list)
+
+    p_get = sub.add_parser("get", help="Retrieve an entry")
+    p_get.add_argument("label", help="Entry label")
+    p_get.add_argument("--field", choices=["username", "password", "notes", "created_utc", "updated_utc", "label"],
+                       help="Print only one field")
+    p_get.set_defaults(func=cmd_get)
+
+    p_rm = sub.add_parser("remove", help="Remove an entry")
+    p_rm.add_argument("label", help="Entry label")
+    p_rm.set_defaults(func=cmd_remove)
+
+    p_cm = sub.add_parser("change-master", help="Change master password (re-key vault)")
+    p_cm.set_defaults(func=cmd_change_master)
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
